@@ -45,7 +45,7 @@ class MusicDashboard extends StatefulWidget {
 }
 
 class _MusicDashboardState extends State<MusicDashboard>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   static const String _primaryUrl = "https://solo.yinxh.fun";
   static const String _fallbackUrl = "http://38.14.210.31:8001";
   String baseUrl = _primaryUrl;
@@ -74,6 +74,7 @@ class _MusicDashboardState extends State<MusicDashboard>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initApp();
     _rotationController = AnimationController(
       duration: const Duration(seconds: 15),
@@ -107,6 +108,7 @@ class _MusicDashboardState extends State<MusicDashboard>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _saveProgressTimer?.cancel(); // 取消定时器
     _savePreferences(); // 最后保存一次
     _audioPlayer.dispose();
@@ -115,11 +117,21 @@ class _MusicDashboardState extends State<MusicDashboard>
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // iOS 上应用进入后台时保存数据，防止系统杀死应用后数据丢失
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      _savePreferences();
+    }
+  }
+
   // --- 逻辑函数 ---
   // 初始化：检测服务器可用性后再加载数据
   Future<void> _initApp() async {
     await _checkBaseUrl();
-    _loadPreferences();
+    await _loadPreferences();
     _fetchMusic();
   }
 
@@ -205,21 +217,46 @@ class _MusicDashboardState extends State<MusicDashboard>
     }
   }
 
+  // 单独保存喜欢列表（确保收藏保存不受其他数据影响）
+  Future<void> _saveFavorites() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('favorites', json.encode(_favoriteIds));
+    } catch (e) {
+      print('保存喜欢列表失败: $e');
+    }
+  }
+
   // 保存设置
   Future<void> _savePreferences() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt('playMode', _playMode.index);
       await prefs.setDouble('volume', _audioPlayer.volume);
+    } catch (e) {
+      print('保存基础设置失败: $e');
+    }
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
       await prefs.setString('recentList', json.encode(_recentList));
+    } catch (e) {
+      print('保存最近播放失败: $e');
+    }
 
-      // 保存播放队列
+    try {
+      final prefs = await SharedPreferences.getInstance();
       await prefs.setString('playQueue', json.encode(_playQueue));
+    } catch (e) {
+      print('保存播放队列失败: $e');
+    }
 
-      // 保存喜欢列表
-      await prefs.setString('favorites', json.encode(_favoriteIds));
+    // 保存喜欢列表
+    await _saveFavorites();
 
-      // 保存当前播放音乐和进度
+    // 保存当前播放音乐和进度
+    try {
+      final prefs = await SharedPreferences.getInstance();
       if (_currentPlayingMusic != null) {
         await prefs.setString(
           'currentMusic',
@@ -231,7 +268,7 @@ class _MusicDashboardState extends State<MusicDashboard>
         await prefs.remove('playPosition');
       }
     } catch (e) {
-      print('保存设置失败: $e');
+      print('保存播放进度失败: $e');
     }
   }
 
@@ -606,7 +643,8 @@ class _MusicDashboardState extends State<MusicDashboard>
         _showToast('已添加到喜欢');
       }
     });
-    _savePreferences();
+    // 立即单独保存喜欢列表，确保 iOS 上不会因其他数据保存失败而丢失
+    _saveFavorites();
   }
 
   bool _isFavorite(String musicId) {
@@ -997,11 +1035,6 @@ class _MusicDashboardState extends State<MusicDashboard>
                   fontSize: 28,
                   letterSpacing: -0.5,
                 ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.add_circle_outline, size: 28),
-                color: Colors.black87,
-                onPressed: _uploadMusic,
               ),
             ],
           ),
