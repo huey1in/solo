@@ -46,9 +46,7 @@ class MusicDashboard extends StatefulWidget {
 
 class _MusicDashboardState extends State<MusicDashboard>
     with TickerProviderStateMixin, WidgetsBindingObserver {
-  static const String _primaryUrl = "https://solo.yinxh.fun";
-  static const String _fallbackUrl = "http://38.14.210.31:8001";
-  String baseUrl = _primaryUrl;
+  static const String baseUrl = "https://solo.yinxh.fun";
   List<dynamic> _musicList = [];
   List<dynamic> _recentList = [];
   bool _isLoading = true;
@@ -128,27 +126,10 @@ class _MusicDashboardState extends State<MusicDashboard>
   }
 
   // --- 逻辑函数 ---
-  // 初始化：检测服务器可用性后再加载数据
+  // 初始化：加载设置和数据
   Future<void> _initApp() async {
-    await _checkBaseUrl();
     await _loadPreferences();
     _fetchMusic();
-  }
-
-  // 检测主地址是否可用，不可用则回退到备用地址
-  Future<void> _checkBaseUrl() async {
-    try {
-      final response = await http
-          .get(Uri.parse('$_primaryUrl/api/music'))
-          .timeout(const Duration(seconds: 3));
-      if (response.statusCode == 200) {
-        setState(() => baseUrl = _primaryUrl);
-        return;
-      }
-    } catch (_) {}
-    // 主地址不可用，切换到备用地址
-    setState(() => baseUrl = _fallbackUrl);
-    print('主服务器不可用，已切换到备用地址: $_fallbackUrl');
   }
 
   // 加载保存的设置
