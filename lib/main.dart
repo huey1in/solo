@@ -3,6 +3,7 @@ import 'package:http/http.dart' as http;
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:convert';
@@ -11,11 +12,21 @@ import 'dart:math';
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'music_player_page.dart'; // 请确保该文件存在并引用
+import 'audio_cache_service.dart';
 
 enum PlayMode { sequence, listLoop, singleLoop, shuffle }
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 初始化后台音频服务（Android前台服务 + iOS后台音频）
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.solo.music.channel.audio',
+    androidNotificationChannelName: 'Solo Music',
+    androidNotificationOngoing: true,
+    androidStopForegroundOnPause: true,
+  );
+  // 初始化音频缓存服务
+  await AudioCacheService.instance.init();
   runApp(const SoloMusicApp());
 }
 
@@ -258,7 +269,9 @@ class _MusicDashboardState extends State<MusicDashboard>
         });
 
         try {
-          await _audioPlayer.setUrl('$baseUrl/api/music/${music['id']}/stream');
+          final streamUrl = '$baseUrl/api/music/${music['id']}/stream';
+          final audioSource = AudioCacheService.instance.getAudioSource(streamUrl);
+          await _audioPlayer.setAudioSource(audioSource);
           await _audioPlayer.seek(Duration(milliseconds: savedPosition));
         } catch (e) {
           print('恢复播放失败: $e');
@@ -465,7 +478,9 @@ class _MusicDashboardState extends State<MusicDashboard>
     setState(() => _currentPlayingMusic = music);
 
     try {
-      await _audioPlayer.setUrl('$baseUrl/api/music/${music['id']}/stream');
+      final streamUrl = '$baseUrl/api/music/${music['id']}/stream';
+      final audioSource = AudioCacheService.instance.getAudioSource(streamUrl);
+      await _audioPlayer.setAudioSource(audioSource);
       _audioPlayer.play();
       _savePreferences(); // 保存当前播放音乐
     } catch (e) {
