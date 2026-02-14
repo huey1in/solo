@@ -3,6 +3,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:ui';
 import 'main.dart'; // 确保导入 PlayMode 枚举
+import 'lyric_view.dart';
 
 class MusicPlayerPage extends StatefulWidget {
   final dynamic Function() getCurrentMusic;
@@ -59,6 +60,7 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
   dynamic _currentMusic;
   double _volume = 1.0;
   bool _isFavorite = false;
+  bool _showLyrics = false;
 
   @override
   void initState() {
@@ -168,7 +170,8 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
   @override
   Widget build(BuildContext context) {
     final musicId = _currentMusic?['id'];
-    final coverUrl = '${widget.baseUrl}/api/music/$musicId/cover';
+    final bool hasCover = _currentMusic?['has_cover'] == true;
+    final coverUrl = hasCover ? '${widget.baseUrl}/api/music/$musicId/cover' : '';
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -199,8 +202,21 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
                 _buildTopBar(),
                 const Spacer(),
 
-                // Hero 封面图
-                _buildHeroCover(coverUrl, musicId),
+                // 点击封面切换歌词 / 点击歌词切换封面
+                GestureDetector(
+                  onTap: () => setState(() => _showLyrics = !_showLyrics),
+                  child: _showLyrics
+                      ? SizedBox(
+                          width: MediaQuery.of(context).size.width * 0.85,
+                          height: MediaQuery.of(context).size.width * 0.8,
+                          child: LyricView(
+                            baseUrl: widget.baseUrl,
+                            musicId: musicId,
+                            currentPosition: _currentPosition,
+                          ),
+                        )
+                      : _buildHeroCover(coverUrl, musicId),
+                ),
 
                 const Spacer(),
                 _buildSongInfo(),
@@ -216,6 +232,13 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
   }
 
   Widget _buildBlurredBackground(String url) {
+    if (url.isEmpty) {
+      return Container(
+        width: double.infinity,
+        height: double.infinity,
+        color: Colors.black87,
+      );
+    }
     return Container(
       width: double.infinity,
       height: double.infinity,
@@ -292,25 +315,34 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(20),
-            child: CachedNetworkImage(
-              imageUrl: url,
-              fit: BoxFit.cover,
-              placeholder: (context, url) => Container(
-                color: Colors.grey[900],
-                child: const CircularProgressIndicator(
-                  color: Colors.white38,
-                  strokeWidth: 2,
+            child: url.isNotEmpty
+              ? CachedNetworkImage(
+                  imageUrl: url,
+                  fit: BoxFit.cover,
+                  placeholder: (context, url) => Container(
+                    color: Colors.grey[900],
+                    child: const CircularProgressIndicator(
+                      color: Colors.white38,
+                      strokeWidth: 2,
+                    ),
+                  ),
+                  errorWidget: (context, url, error) => Container(
+                    color: Colors.grey[900],
+                    child: const Icon(
+                      Icons.music_note,
+                      color: Colors.white,
+                      size: 100,
+                    ),
+                  ),
+                )
+              : Container(
+                  color: Colors.grey[900],
+                  child: const Icon(
+                    Icons.music_note,
+                    color: Colors.white54,
+                    size: 100,
+                  ),
                 ),
-              ),
-              errorWidget: (context, url, error) => Container(
-                color: Colors.grey[900],
-                child: const Icon(
-                  Icons.music_note,
-                  color: Colors.white,
-                  size: 100,
-                ),
-              ),
-            ),
           ),
         ),
       ),
@@ -368,18 +400,28 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
   }
 
   Widget _buildProgressBar() {
+    final bufferedPosition = widget.audioPlayer.bufferedPosition;
+    final double bufferedValue = _totalDuration.inMilliseconds > 0
+        ? bufferedPosition.inMilliseconds / _totalDuration.inMilliseconds
+        : 0.0;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 30, 20, 10),
       child: Column(
         children: [
+          // 单个 Slider，缓冲进度画在轨道背景上
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
               trackHeight: 4,
               thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
               overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
               activeTrackColor: Colors.white,
-              inactiveTrackColor: Colors.white.withOpacity(0.2),
+              inactiveTrackColor: Colors.white.withOpacity(0.15),
               thumbColor: Colors.white,
+              trackShape: _BufferedTrackShape(
+                bufferedValue: bufferedValue.clamp(0.0, 1.0),
+                bufferedColor: Colors.white.withOpacity(0.35),
+              ),
             ),
             child: Slider(
               value: _totalDuration.inSeconds > 0
@@ -619,33 +661,43 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
                               return ListTile(
                                 leading: ClipRRect(
                                   borderRadius: BorderRadius.circular(6),
-                                  child: CachedNetworkImage(
-                                    imageUrl:
-                                        '${widget.baseUrl}/api/music/${music['id']}/cover',
-                                    width: 42,
-                                    height: 42,
-                                    fit: BoxFit.cover,
-                                    placeholder: (c, url) => Container(
-                                      width: 42,
-                                      height: 42,
-                                      color: Colors.grey[800],
-                                      child: const Icon(
-                                        Icons.music_note,
-                                        color: Colors.grey,
-                                        size: 20,
+                                  child: music['has_cover'] == true
+                                    ? CachedNetworkImage(
+                                        imageUrl:
+                                            '${widget.baseUrl}/api/music/${music['id']}/cover',
+                                        width: 42,
+                                        height: 42,
+                                        fit: BoxFit.cover,
+                                        placeholder: (c, url) => Container(
+                                          width: 42,
+                                          height: 42,
+                                          color: Colors.grey[800],
+                                          child: const Icon(
+                                            Icons.music_note,
+                                            color: Colors.grey,
+                                            size: 20,
+                                          ),
+                                        ),
+                                        errorWidget: (c, url, e) => Container(
+                                          width: 42,
+                                          height: 42,
+                                          color: Colors.grey[800],
+                                          child: const Icon(
+                                            Icons.music_note,
+                                            color: Colors.grey,
+                                            size: 20,
+                                          ),
+                                        ),
+                                      )
+                                    : Container(
+                                        width: 42,
+                                        height: 42,
+                                        decoration: BoxDecoration(
+                                          color: Colors.grey[800],
+                                          borderRadius: BorderRadius.circular(6),
+                                        ),
+                                        child: const Icon(Icons.music_note, color: Colors.grey, size: 20),
                                       ),
-                                    ),
-                                    errorWidget: (c, url, e) => Container(
-                                      width: 42,
-                                      height: 42,
-                                      color: Colors.grey[800],
-                                      child: const Icon(
-                                        Icons.music_note,
-                                        color: Colors.grey,
-                                        size: 20,
-                                      ),
-                                    ),
-                                  ),
                                 ),
                                 title: Text(
                                   music['title'] ?? '未知歌曲',
@@ -709,5 +761,74 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
         ),
       ),
     );
+  }
+}
+
+/// 自定义 Slider 轨道：在同一条轨道上显示缓冲进度
+/// 三层颜色：已播放(activeTrackColor) > 已缓冲(bufferedColor) > 未加载(inactiveTrackColor)
+class _BufferedTrackShape extends RoundedRectSliderTrackShape {
+  final double bufferedValue; // 0.0 ~ 1.0
+  final Color bufferedColor;
+
+  _BufferedTrackShape({
+    required this.bufferedValue,
+    required this.bufferedColor,
+  });
+
+  @override
+  void paint(
+    PaintingContext context,
+    Offset offset, {
+    required RenderBox parentBox,
+    required SliderThemeData sliderTheme,
+    required Animation<double> enableAnimation,
+    required TextDirection textDirection,
+    required Offset thumbCenter,
+    Offset? secondaryOffset,
+    bool isDiscrete = false,
+    bool isEnabled = false,
+    double additionalActiveTrackHeight = 0,
+  }) {
+    final Rect trackRect = getPreferredRect(
+      parentBox: parentBox,
+      offset: offset,
+      sliderTheme: sliderTheme,
+      isEnabled: isEnabled,
+      isDiscrete: isDiscrete,
+    );
+
+    final canvas = context.canvas;
+    final trackHeight = sliderTheme.trackHeight ?? 4;
+    final radius = Radius.circular(trackHeight / 2);
+
+    // 1. 底层：未加载部分（最暗）
+    final inactiveRect = RRect.fromRectAndRadius(trackRect, radius);
+    canvas.drawRRect(
+      inactiveRect,
+      Paint()..color = sliderTheme.inactiveTrackColor ?? Colors.grey,
+    );
+
+    // 2. 中层：已缓冲部分（半透明）
+    final bufferedWidth = trackRect.width * bufferedValue;
+    if (bufferedWidth > 0) {
+      final bufferedRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(trackRect.left, trackRect.top, bufferedWidth, trackRect.height),
+        radius,
+      );
+      canvas.drawRRect(bufferedRect, Paint()..color = bufferedColor);
+    }
+
+    // 3. 顶层：已播放部分（最亮）
+    final activeWidth = thumbCenter.dx - trackRect.left;
+    if (activeWidth > 0) {
+      final activeRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(trackRect.left, trackRect.top, activeWidth, trackRect.height),
+        radius,
+      );
+      canvas.drawRRect(
+        activeRect,
+        Paint()..color = sliderTheme.activeTrackColor ?? Colors.white,
+      );
+    }
   }
 }

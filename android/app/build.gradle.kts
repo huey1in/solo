@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.solomusic.solo_music_app"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36
     // ndkVersion = flutter.ndkVersion // 注释掉，使用系统中可用的 NDK 版本
 
     compileOptions {

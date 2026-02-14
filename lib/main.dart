@@ -3,7 +3,8 @@ import 'package:http/http.dart' as http;
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
+// just_audio_background 暂时禁用（模拟器兼容性问题）
+// import 'package:just_audio_background/just_audio_background.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:convert';
@@ -11,6 +12,8 @@ import 'dart:ui';
 import 'dart:math';
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:audio_session/audio_session.dart';
 import 'music_player_page.dart'; // 请确保该文件存在并引用
 import 'audio_cache_service.dart';
 
@@ -18,13 +21,14 @@ enum PlayMode { sequence, listLoop, singleLoop, shuffle }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // 初始化后台音频服务（Android前台服务 + iOS后台音频）
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.solo.music.channel.audio',
-    androidNotificationChannelName: 'Solo Music',
-    androidNotificationOngoing: true,
-    androidStopForegroundOnPause: true,
-  );
+  // just_audio_background 暂时禁用（模拟器上 _audioHandler late init 会崩溃）
+  // 在真机上可取消注释以启用通知栏控制
+  // await JustAudioBackground.init(
+  //   androidNotificationChannelId: 'com.solo.music.channel.audio',
+  //   androidNotificationChannelName: 'Solo Music',
+  //   androidNotificationOngoing: true,
+  //   androidStopForegroundOnPause: true,
+  // );
   // 初始化音频缓存服务
   await AudioCacheService.instance.init();
   runApp(const SoloMusicApp());
@@ -70,17 +74,21 @@ class _MusicDashboardState extends State<MusicDashboard>
 
   // 底部导航和喜欢列表
   int _currentIndex = 0;
-  List<String> _favoriteIds = [];
+  List<dynamic> _favoriteSongs = [];
 
   final AudioPlayer _audioPlayer = AudioPlayer();
   dynamic _currentPlayingMusic;
   bool _isPlaying = false;
   Duration _currentPosition = Duration.zero;
   Duration _totalDuration = Duration.zero;
+  // bufferedPosition 由 audioPlayer.bufferedPosition 直接读取
   PlayMode _playMode = PlayMode.listLoop;
   late AnimationController _rotationController;
   Timer? _saveProgressTimer; // 定时保存进度的定时器
+  Timer? _searchDebounce; // 搜索防抖定时器
   bool _isInitialized = false; // 标记是否已完成初始化加载，防止未加载完就触发保存
+  bool _isOffline = false; // 网络状态
+  StreamSubscription? _connectivitySubscription;
 
   @override
   void initState() {
@@ -99,15 +107,44 @@ class _MusicDashboardState extends State<MusicDashboard>
         _isPlaying ? _rotationController.repeat() : _rotationController.stop();
       }
     });
-    _audioPlayer.positionStream.listen(
-      (p) => setState(() => _currentPosition = p),
-    );
+    _audioPlayer.positionStream.listen((p) {
+      if (mounted) {
+        setState(() => _currentPosition = p);
+        // 预加载下一首：当前歌曲播放到 80% 时后台缓存下一首
+        _maybePreloadNext();
+      }
+    });
     _audioPlayer.durationStream.listen(
       (d) => setState(() => _totalDuration = d ?? Duration.zero),
     );
     _audioPlayer.processingStateStream.listen((state) {
       if (state == ProcessingState.completed) _handleNext();
     });
+
+    // 配置音频会话（音频焦点处理：来电暂停、导航降低音量等）
+    try {
+      _configureAudioSession();
+    } catch (e) {
+      print('配置音频会话失败: $e');
+    }
+
+    // 网络状态监听
+    try {
+      _connectivitySubscription = Connectivity().onConnectivityChanged.listen((results) {
+        final wasOffline = _isOffline;
+        final isNowOffline = results.contains(ConnectivityResult.none);
+        if (mounted) {
+          setState(() => _isOffline = isNowOffline);
+          if (isNowOffline && !wasOffline) {
+            _showToast('网络已断开，已缓存的歌曲可继续播放');
+          } else if (!isNowOffline && wasOffline) {
+            _showToast('网络已恢复');
+          }
+        }
+      });
+    } catch (e) {
+      print('网络状态监听初始化失败: $e');
+    }
 
     // 启动定时保存，每5秒保存一次播放进度
     _saveProgressTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -120,7 +157,9 @@ class _MusicDashboardState extends State<MusicDashboard>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _saveProgressTimer?.cancel(); // 取消定时器
+    _saveProgressTimer?.cancel();
+    _searchDebounce?.cancel();
+    _connectivitySubscription?.cancel();
     _savePreferences(); // 最后保存一次
     _audioPlayer.dispose();
     _rotationController.dispose();
@@ -145,7 +184,7 @@ class _MusicDashboardState extends State<MusicDashboard>
     try {
       // 使用同一个 prefs 实例一次性保存所有关键数据
       await Future.wait([
-        prefs.setString('favorites', json.encode(_favoriteIds)),
+        prefs.setString('favorites', json.encode(_favoriteSongs)),
         prefs.setInt('playMode', _playMode.index),
         prefs.setDouble('volume', _audioPlayer.volume),
         prefs.setString('recentList', json.encode(_recentList)),
@@ -160,19 +199,87 @@ class _MusicDashboardState extends State<MusicDashboard>
     }
   }
 
+  // 配置音频会话（音频焦点处理）
+  Future<void> _configureAudioSession() async {
+    final session = await AudioSession.instance;
+    await session.configure(const AudioSessionConfiguration(
+      avAudioSessionCategory: AVAudioSessionCategory.playback,
+      avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.duckOthers,
+      avAudioSessionMode: AVAudioSessionMode.defaultMode,
+      androidAudioAttributes: AndroidAudioAttributes(
+        contentType: AndroidAudioContentType.music,
+        usage: AndroidAudioUsage.media,
+      ),
+      androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+      androidWillPauseWhenDucked: false,
+    ));
+
+    // 监听音频焦点变化
+    session.interruptionEventStream.listen((event) {
+      if (event.begin) {
+        // 被打断（来电等）：暂停
+        if (_isPlaying) _audioPlayer.pause();
+      } else {
+        // 打断结束：恢复播放
+        if (event.type == AudioInterruptionType.pause) {
+          _audioPlayer.play();
+        }
+      }
+    });
+
+    // 监听音频变得嘈杂（如拔出耳机）：暂停
+    session.becomingNoisyEventStream.listen((_) {
+      if (_isPlaying) _audioPlayer.pause();
+    });
+  }
+
+  // 预加载下一首（当前歌曲播放到50%时触发完整下载）
+  bool _preloadTriggered = false;
+  void _maybePreloadNext() {
+    if (_preloadTriggered) return;
+    if (_totalDuration.inSeconds <= 0) return;
+    final progress = _currentPosition.inMilliseconds / _totalDuration.inMilliseconds;
+    if (progress < 0.5) return;
+
+    _preloadTriggered = true;
+    final nextMusic = _getNextMusic();
+    if (nextMusic == null) return;
+
+    final nextUrl = '$baseUrl/api/music/${nextMusic['id']}/stream';
+    // 完整下载下一首到本地缓存（优先级最高，不影响当前播放）
+    AudioCacheService.instance.preloadUrl(nextUrl);
+  }
+
+  // 获取下一首音乐（不实际播放）
+  dynamic _getNextMusic() {
+    if (_playQueue.isEmpty) return null;
+    if (_playMode == PlayMode.shuffle) {
+      return _playQueue[Random().nextInt(_playQueue.length)];
+    }
+    int index = _playQueue.indexWhere(
+      (m) => m['id'] == _currentPlayingMusic?['id'],
+    );
+    if (index == -1) return _playQueue[0];
+    int next = index + 1;
+    if (next >= _playQueue.length) {
+      if (_playMode == PlayMode.sequence) return null;
+      next = 0;
+    }
+    return _playQueue[next];
+  }
+
   // --- 逻辑函数 ---
   // 初始化：加载设置和数据
   Future<void> _initApp() async {
     await _loadPreferences();
     _isInitialized = true; // 标记已完成加载，允许保存
-    // 先加载本地缓存
+    // 先加载本地缓存（快速显示）
     await _loadCachedMusicList();
-    // 如果缓存为空，则从服务器获取
-    if (_musicList.isEmpty) {
-      await _fetchMusic();
-    } else {
+    if (_musicList.isNotEmpty) {
       setState(() => _isLoading = false);
     }
+    // 无论是否有缓存，都从服务器获取最新数据
+    await _fetchMusic();
   }
 
   // 从本地缓存加载音乐列表
@@ -251,7 +358,13 @@ class _MusicDashboardState extends State<MusicDashboard>
       if (favoritesJson != null) {
         final decoded = json.decode(favoritesJson) as List;
         setState(() {
-          _favoriteIds = decoded.cast<String>();
+          // 兼容旧版（纯ID列表）和新版（完整歌曲对象列表）
+          if (decoded.isNotEmpty && decoded.first is String) {
+            // 旧版ID列表，清空（无法恢复完整数据）
+            _favoriteSongs = [];
+          } else {
+            _favoriteSongs = decoded;
+          }
         });
       }
     } catch (e) {
@@ -270,8 +383,18 @@ class _MusicDashboardState extends State<MusicDashboard>
 
         try {
           final streamUrl = '$baseUrl/api/music/${music['id']}/stream';
-          final audioSource = AudioCacheService.instance.getAudioSource(streamUrl);
-          await _audioPlayer.setAudioSource(audioSource);
+          if (AudioCacheService.instance.isCached(streamUrl)) {
+            await _audioPlayer.setAudioSource(
+              AudioSource.file(AudioCacheService.instance.getCacheFilePath(streamUrl)),
+            );
+          } else {
+            await _audioPlayer.setAudioSource(
+              LockCachingAudioSource(
+                Uri.parse(streamUrl),
+                cacheFile: AudioCacheService.instance.getCacheFile(streamUrl),
+              ),
+            );
+          }
           await _audioPlayer.seek(Duration(milliseconds: savedPosition));
         } catch (e) {
           print('恢复播放失败: $e');
@@ -287,7 +410,7 @@ class _MusicDashboardState extends State<MusicDashboard>
     if (!_isInitialized) return; // 未初始化完成不保存，防止空数据覆盖
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('favorites', json.encode(_favoriteIds));
+      await prefs.setString('favorites', json.encode(_favoriteSongs));
     } catch (e) {
       print('保存喜欢列表失败: $e');
     }
@@ -415,7 +538,7 @@ class _MusicDashboardState extends State<MusicDashboard>
   Future<void> _fetchMusic({bool isRefresh = false}) async {
     try {
       final response = await http.get(
-        Uri.parse('$baseUrl/api/music?search=$_searchQuery'),
+        Uri.parse('$baseUrl/api/music?search=$_searchQuery&page=1&page_size=200'),
       );
       if (response.statusCode == 200) {
         setState(() {
@@ -478,9 +601,22 @@ class _MusicDashboardState extends State<MusicDashboard>
     setState(() => _currentPlayingMusic = music);
 
     try {
+      _preloadTriggered = false; // 重置预加载标志
+      AudioCacheService.instance.cancelPreload(); // 取消旧的预加载，释放带宽给当前歌曲
       final streamUrl = '$baseUrl/api/music/${music['id']}/stream';
-      final audioSource = AudioCacheService.instance.getAudioSource(streamUrl);
-      await _audioPlayer.setAudioSource(audioSource);
+      // 优先使用本地缓存，否则边播边缓存
+      if (AudioCacheService.instance.isCached(streamUrl)) {
+        await _audioPlayer.setAudioSource(
+          AudioSource.file(AudioCacheService.instance.getCacheFilePath(streamUrl)),
+        );
+      } else {
+        await _audioPlayer.setAudioSource(
+          LockCachingAudioSource(
+            Uri.parse(streamUrl),
+            cacheFile: AudioCacheService.instance.getCacheFile(streamUrl),
+          ),
+        );
+      }
       _audioPlayer.play();
       _savePreferences(); // 保存当前播放音乐
     } catch (e) {
@@ -488,11 +624,11 @@ class _MusicDashboardState extends State<MusicDashboard>
       _showToast('歌曲「${music['title']}」无法播放，已跳过');
 
       // 从喜欢列表中移除（如果存在）
-      if (_favoriteIds.contains(music['id'])) {
+      if (_isFavorite(music['id'])) {
         setState(() {
-          _favoriteIds.remove(music['id']);
+          _favoriteSongs.removeWhere((m) => m['id'] == music['id']);
         });
-        _savePreferences();
+        _saveFavorites();
       }
 
       // 从播放队列中移除
@@ -627,7 +763,7 @@ class _MusicDashboardState extends State<MusicDashboard>
             title: isFavorite ? '取消收藏' : '添加到喜欢',
             onTap: () {
               Navigator.pop(context);
-              _toggleFavorite(music['id']);
+              _toggleFavorite(music);
             },
           ),
           Divider(height: 1, color: Colors.grey.withOpacity(0.2)),
@@ -717,38 +853,28 @@ class _MusicDashboardState extends State<MusicDashboard>
   }
 
   // --- 喜欢列表管理 ---
-  Future<void> _toggleFavorite(String musicId) async {
+  Future<void> _toggleFavorite(dynamic music) async {
+    final musicId = music is String ? music : music['id'];
     setState(() {
-      if (_favoriteIds.contains(musicId)) {
-        _favoriteIds.remove(musicId);
+      if (_isFavorite(musicId)) {
+        _favoriteSongs.removeWhere((m) => m['id'] == musicId);
         _showToast('已取消收藏');
       } else {
-        _favoriteIds.add(musicId);
+        if (music is! String) {
+          _favoriteSongs.add(music);
+        }
         _showToast('已添加到喜欢');
       }
     });
-    // 立即同步保存喜欢列表，确保 iOS 上不会因退出丢失
     await _saveFavorites();
   }
 
   bool _isFavorite(String musicId) {
-    return _favoriteIds.contains(musicId);
+    return _favoriteSongs.any((m) => m['id'] == musicId);
   }
 
   List<dynamic> _getFavoriteSongs() {
-    final availableSongs = <dynamic>[];
-
-    for (var musicId in _favoriteIds) {
-      final music = _musicList.firstWhere(
-        (m) => m['id'] == musicId,
-        orElse: () => null,
-      );
-      if (music != null) {
-        availableSongs.add(music);
-      }
-    }
-
-    return availableSongs;
+    return List.from(_favoriteSongs);
   }
 
   // 自定义弹窗
@@ -1103,28 +1229,38 @@ class _MusicDashboardState extends State<MusicDashboard>
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: CachedNetworkImage(
-                imageUrl: '$baseUrl/api/music/${music['id']}/cover',
-                width: 50,
-                height: 50,
-                fit: BoxFit.cover,
-                placeholder: (context, url) => Container(
-                  width: 50,
-                  height: 50,
-                  color: Colors.grey[200],
-                  child: const Icon(
-                    Icons.music_note,
-                    color: Colors.grey,
-                    size: 24,
+              child: music['has_cover'] == true
+                ? CachedNetworkImage(
+                    imageUrl: '$baseUrl/api/music/${music['id']}/cover',
+                    width: 50,
+                    height: 50,
+                    fit: BoxFit.cover,
+                    placeholder: (context, url) => Container(
+                      width: 50,
+                      height: 50,
+                      color: Colors.grey[200],
+                      child: const Icon(
+                        Icons.music_note,
+                        color: Colors.grey,
+                        size: 24,
+                      ),
+                    ),
+                    errorWidget: (context, url, error) => Container(
+                      width: 50,
+                      height: 50,
+                      color: Colors.grey[300],
+                      child: const Icon(Icons.music_note, color: Colors.grey),
+                    ),
+                  )
+                : Container(
+                    width: 50,
+                    height: 50,
+                    decoration: BoxDecoration(
+                      color: Colors.grey[200],
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.music_note, color: Colors.grey, size: 24),
                   ),
-                ),
-                errorWidget: (context, url, error) => Container(
-                  width: 50,
-                  height: 50,
-                  color: Colors.grey[300],
-                  child: const Icon(Icons.music_note, color: Colors.grey),
-                ),
-              ),
             ),
             if (isPlaying) const AnimatedEqualizer(),
           ],
@@ -1146,7 +1282,7 @@ class _MusicDashboardState extends State<MusicDashboard>
         ),
         trailing: IconButton(
           icon: const Icon(Icons.favorite, color: Color(0xFFFF4444)),
-          onPressed: () => _toggleFavorite(music['id']),
+          onPressed: () => _toggleFavorite(music),
         ),
       ),
     );
@@ -1197,7 +1333,11 @@ class _MusicDashboardState extends State<MusicDashboard>
           controller: _searchController,
           onChanged: (value) {
             setState(() => _searchQuery = value);
-            _fetchMusic();
+            // 搜索防抖：300ms内无新输入才发起请求
+            _searchDebounce?.cancel();
+            _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+              _fetchMusic();
+            });
           },
           decoration: InputDecoration(
             hintText: '搜索歌曲...',
@@ -1326,29 +1466,40 @@ class _MusicDashboardState extends State<MusicDashboard>
     bool showHero = false,
     bool showAnimation = false, // 是否显示播放动画
   }) {
+    final bool hasCover = music['has_cover'] == true;
     Widget img = ClipRRect(
       borderRadius: BorderRadius.circular(radius),
-      child: CachedNetworkImage(
-        imageUrl: '$baseUrl/api/music/${music['id']}/cover',
-        width: size,
-        height: size,
-        fit: BoxFit.cover,
-        placeholder: (c, url) => Container(
-          width: size,
-          height: size,
-          decoration: BoxDecoration(
-            color: Colors.grey[200],
-            borderRadius: BorderRadius.circular(radius),
-          ),
-          child: const Icon(Icons.music_note, color: Colors.grey),
-        ),
-        errorWidget: (c, url, e) => Container(
-          width: size,
-          height: size,
-          color: Colors.grey[200],
-          child: const Icon(Icons.music_note),
-        ),
-      ),
+      child: hasCover
+          ? CachedNetworkImage(
+              imageUrl: '$baseUrl/api/music/${music['id']}/cover',
+              width: size,
+              height: size,
+              fit: BoxFit.cover,
+              placeholder: (c, url) => Container(
+                width: size,
+                height: size,
+                decoration: BoxDecoration(
+                  color: Colors.grey[200],
+                  borderRadius: BorderRadius.circular(radius),
+                ),
+                child: const Icon(Icons.music_note, color: Colors.grey),
+              ),
+              errorWidget: (c, url, e) => Container(
+                width: size,
+                height: size,
+                color: Colors.grey[200],
+                child: const Icon(Icons.music_note),
+              ),
+            )
+          : Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                color: Colors.grey[200],
+                borderRadius: BorderRadius.circular(radius),
+              ),
+              child: Icon(Icons.music_note, color: Colors.grey, size: size * 0.4),
+            ),
     );
 
     // 如果需要显示动画遮罩，使用 Stack 叠加
@@ -1375,7 +1526,7 @@ class _MusicDashboardState extends State<MusicDashboard>
     return showHero ? Hero(tag: 'cover_${music['id']}', child: img) : img;
   }
 
-  // 毛玻璃浮动底栏
+  // iOS 26 Liquid Glass 拟态玻璃浮动底栏
   Widget _buildGlassBottomPlayer() {
     return Positioned(
       bottom: MediaQuery.of(context).padding.bottom + 10,
@@ -1400,7 +1551,7 @@ class _MusicDashboardState extends State<MusicDashboard>
               isFavorite: _isFavorite(_currentPlayingMusic['id']),
               onToggleFavorite: () {
                 setState(() {
-                  _toggleFavorite(_currentPlayingMusic['id']);
+                  _toggleFavorite(_currentPlayingMusic);
                 });
               },
               checkIsFavorite: _isFavorite,
@@ -1414,59 +1565,231 @@ class _MusicDashboardState extends State<MusicDashboard>
             ),
           ),
         ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(30),
-          child: BackdropFilter(
-            filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
-            child: Container(
-              height: 70,
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              color: Colors.black.withOpacity(0.7),
-              child: Row(
-                children: [
-                  RotationTransition(
-                    turns: _rotationController,
-                    child: _buildCover(
-                      _currentPlayingMusic,
-                      size: 50,
-                      radius: 25,
-                      showHero: true,
-                    ),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [
+              // 主阴影：玻璃悬浮感
+              BoxShadow(
+                color: Colors.black.withOpacity(0.08),
+                blurRadius: 20,
+                offset: const Offset(0, 8),
+                spreadRadius: 0,
+              ),
+              // 光晕：模拟光线穿过玻璃的漫射
+              BoxShadow(
+                color: Colors.blue.withOpacity(0.04),
+                blurRadius: 30,
+                offset: const Offset(0, 4),
+                spreadRadius: -2,
+              ),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(24),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+              child: Container(
+                height: 72,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(24),
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.white.withOpacity(0.22),
+                      Colors.white.withOpacity(0.10),
+                    ],
                   ),
-                  const SizedBox(width: 15),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _currentPlayingMusic['title'] ?? '',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
+                  border: Border.all(
+                    width: 1.0,
+                    color: Colors.white.withOpacity(0.6),
+                  ),
+                ),
+                child: Stack(
+                  children: [
+                    // 顶部高光（最亮的折射边缘）
+                    Positioned(
+                      top: 0,
+                      left: 10,
+                      right: 10,
+                      child: Container(
+                        height: 1.0,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.white.withOpacity(0.0),
+                              Colors.white.withOpacity(0.95),
+                              Colors.white,
+                              Colors.white.withOpacity(0.95),
+                              Colors.white.withOpacity(0.0),
+                            ],
+                            stops: const [0.0, 0.2, 0.5, 0.8, 1.0],
                           ),
-                          maxLines: 1,
                         ),
-                        Text(
-                          _currentPlayingMusic['artist'] ?? '',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 12,
+                      ),
+                    ),
+                    // 底部反光线条
+                    Positioned(
+                      bottom: 0,
+                      left: 30,
+                      right: 30,
+                      child: Container(
+                        height: 0.5,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.white.withOpacity(0.0),
+                              Colors.white.withOpacity(0.5),
+                              Colors.white.withOpacity(0.0),
+                            ],
                           ),
-                          maxLines: 1,
                         ),
-                      ],
+                      ),
                     ),
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      _isPlaying ? Icons.pause_circle : Icons.play_circle,
-                      color: Colors.white,
-                      size: 35,
+                    // 左侧边缘折射光
+                    Positioned(
+                      top: 10,
+                      bottom: 10,
+                      left: 0,
+                      child: Container(
+                        width: 0.5,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Colors.white.withOpacity(0.0),
+                              Colors.white.withOpacity(0.7),
+                              Colors.white.withOpacity(0.0),
+                            ],
+                          ),
+                        ),
+                      ),
                     ),
-                    onPressed: () => _playMusic(_currentPlayingMusic),
-                  ),
-                ],
+                    // 右侧边缘折射光
+                    Positioned(
+                      top: 10,
+                      bottom: 10,
+                      right: 0,
+                      child: Container(
+                        width: 0.5,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Colors.white.withOpacity(0.0),
+                              Colors.white.withOpacity(0.4),
+                              Colors.white.withOpacity(0.0),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    // 彩虹色散层（模拟光线穿过玻璃的棱镜效果）
+                    Positioned.fill(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(24),
+                          gradient: LinearGradient(
+                            begin: const Alignment(-1.2, -0.8),
+                            end: const Alignment(1.2, 0.8),
+                            colors: [
+                              const Color(0x12FF6EC7), // 粉色折射
+                              const Color(0x08FFD93D), // 黄色
+                              Colors.transparent,
+                              const Color(0x0870D6FF), // 蓝色折射
+                              const Color(0x10A78BFA), // 紫色折射
+                            ],
+                            stops: const [0.0, 0.2, 0.5, 0.8, 1.0],
+                          ),
+                        ),
+                      ),
+                    ),
+                    // 内容区
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      child: Row(
+                        children: [
+                          // 封面（带玻璃阴影）
+                          Container(
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.1),
+                                  blurRadius: 8,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: RotationTransition(
+                              turns: _rotationController,
+                              child: _buildCover(
+                                _currentPlayingMusic,
+                                size: 48,
+                                radius: 24,
+                                showHero: true,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _currentPlayingMusic['title'] ?? '',
+                                  style: TextStyle(
+                                    color: Colors.black.withOpacity(0.85),
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 14,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _currentPlayingMusic['artist'] ?? '',
+                                  style: TextStyle(
+                                    color: Colors.black.withOpacity(0.45),
+                                    fontSize: 12,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          ),
+                          // 播放按钮（内嵌玻璃按钮）
+                          Container(
+                            width: 40,
+                            height: 40,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.black.withOpacity(0.06),
+                              border: Border.all(
+                                color: Colors.white.withOpacity(0.6),
+                                width: 0.5,
+                              ),
+                            ),
+                            child: IconButton(
+                              padding: EdgeInsets.zero,
+                              icon: Icon(
+                                _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                                color: Colors.black.withOpacity(0.7),
+                                size: 24,
+                              ),
+                              onPressed: () => _playMusic(_currentPlayingMusic),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),

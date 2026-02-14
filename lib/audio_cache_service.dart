@@ -3,6 +3,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
 import 'package:just_audio/just_audio.dart';
+import 'package:http/http.dart' as http;
 
 /// 音频缓存服务
 /// 将网络音频流缓存到本地磁盘，避免重复下载导致播放卡顿
@@ -18,6 +19,10 @@ class AudioCacheService {
   Directory? _cacheDir;
   // 最大缓存大小：500MB
   static const int _maxCacheSize = 500 * 1024 * 1024;
+
+  // 当前正在预加载的URL（避免重复下载）
+  String? _preloadingUrl;
+  bool _preloadCancelled = false;
 
   /// 初始化缓存目录
   Future<void> init() async {
@@ -37,10 +42,20 @@ class AudioCacheService {
     return hash;
   }
 
-  /// 获取缓存文件路径
+  /// 获取缓存文件
   File _getCacheFile(String url) {
     final key = _getCacheKey(url);
     return File('${_cacheDir!.path}/$key');
+  }
+
+  /// 获取缓存文件路径（公开方法）
+  String getCacheFilePath(String url) {
+    return _getCacheFile(url).path;
+  }
+
+  /// 获取缓存文件对象（公开方法）
+  File getCacheFile(String url) {
+    return _getCacheFile(url);
   }
 
   /// 检查URL是否已缓存
@@ -107,6 +122,71 @@ class AudioCacheService {
     } catch (e) {
       print('清除音频缓存失败: $e');
     }
+  }
+
+  /// 预加载：完整下载音频文件到本地缓存（优先级最高）
+  /// 下载完成后切歌时直接从本地播放，零缓冲延迟
+  Future<void> preloadUrl(String url) async {
+    if (_cacheDir == null) return;
+    if (isCached(url)) return; // 已缓存，无需下载
+    if (_preloadingUrl == url) return; // 正在下载中，不重复
+
+    _preloadingUrl = url;
+    _preloadCancelled = false;
+
+    try {
+      print('预加载开始: $url');
+      final cacheFile = _getCacheFile(url);
+      final tempFile = File('${cacheFile.path}.tmp');
+
+      final request = http.Request('GET', Uri.parse(url));
+      final response = await http.Client().send(request);
+
+      if (response.statusCode != 200) {
+        print('预加载失败: HTTP ${response.statusCode}');
+        return;
+      }
+
+      final sink = tempFile.openWrite();
+      int downloaded = 0;
+      final contentLength = response.contentLength ?? 0;
+
+      await for (final chunk in response.stream) {
+        if (_preloadCancelled) {
+          await sink.close();
+          if (await tempFile.exists()) await tempFile.delete();
+          print('预加载已取消');
+          return;
+        }
+        sink.add(chunk);
+        downloaded += chunk.length;
+      }
+
+      await sink.flush();
+      await sink.close();
+
+      // 下载完成，重命名为正式缓存文件
+      if (await tempFile.exists() && tempFile.lengthSync() > 0) {
+        await tempFile.rename(cacheFile.path);
+        cacheFile.setLastModifiedSync(DateTime.now());
+        final sizeMB = (downloaded / 1024 / 1024).toStringAsFixed(1);
+        print('预加载完成: ${sizeMB}MB');
+      }
+    } catch (e) {
+      if (!_preloadCancelled) {
+        print('预加载异常: $e');
+      }
+    } finally {
+      if (_preloadingUrl == url) {
+        _preloadingUrl = null;
+      }
+    }
+  }
+
+  /// 取消当前预加载任务
+  void cancelPreload() {
+    _preloadCancelled = true;
+    _preloadingUrl = null;
   }
 
   /// 获取缓存大小（字节）
