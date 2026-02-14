@@ -4,6 +4,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:convert';
 import 'dart:ui';
 import 'dart:math';
@@ -118,10 +119,32 @@ class _MusicDashboardState extends State<MusicDashboard>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    // iOS 上应用进入后台时保存数据，防止系统杀死应用后数据丢失
+    // iOS 上应用进入后台时立即保存数据，防止系统杀死应用后数据丢失
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
-      _savePreferences();
+      // 使用 unawaited 但确保 SharedPreferences 立即写入
+      _saveAllDataImmediately();
+    }
+  }
+
+  // iOS 上需要立即保存所有数据，防止应用被系统杀死
+  Future<void> _saveAllDataImmediately() async {
+    final prefs = await SharedPreferences.getInstance();
+    try {
+      // 使用同一个 prefs 实例一次性保存所有关键数据
+      await Future.wait([
+        prefs.setString('favorites', json.encode(_favoriteIds)),
+        prefs.setInt('playMode', _playMode.index),
+        prefs.setDouble('volume', _audioPlayer.volume),
+        prefs.setString('recentList', json.encode(_recentList)),
+        prefs.setString('playQueue', json.encode(_playQueue)),
+        if (_currentPlayingMusic != null) ...[
+          prefs.setString('currentMusic', json.encode(_currentPlayingMusic)),
+          prefs.setInt('playPosition', _currentPosition.inMilliseconds),
+        ],
+      ]);
+    } catch (e) {
+      print('紧急保存数据失败: $e');
     }
   }
 
@@ -129,7 +152,40 @@ class _MusicDashboardState extends State<MusicDashboard>
   // 初始化：加载设置和数据
   Future<void> _initApp() async {
     await _loadPreferences();
-    _fetchMusic();
+    // 先加载本地缓存
+    await _loadCachedMusicList();
+    // 如果缓存为空，则从服务器获取
+    if (_musicList.isEmpty) {
+      await _fetchMusic();
+    } else {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  // 从本地缓存加载音乐列表
+  Future<void> _loadCachedMusicList() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cachedJson = prefs.getString('cachedMusicList');
+      if (cachedJson != null) {
+        final decoded = json.decode(cachedJson) as List;
+        setState(() {
+          _musicList = decoded;
+        });
+      }
+    } catch (e) {
+      print('加载缓存音乐列表失败: $e');
+    }
+  }
+
+  // 保存音乐列表到本地缓存
+  Future<void> _cacheMusicList() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('cachedMusicList', json.encode(_musicList));
+    } catch (e) {
+      print('缓存音乐列表失败: $e');
+    }
   }
 
   // 加载保存的设置
@@ -326,7 +382,7 @@ class _MusicDashboardState extends State<MusicDashboard>
     }
   }
 
-  Future<void> _fetchMusic() async {
+  Future<void> _fetchMusic({bool isRefresh = false}) async {
     try {
       final response = await http.get(
         Uri.parse('$baseUrl/api/music?search=$_searchQuery'),
@@ -336,10 +392,25 @@ class _MusicDashboardState extends State<MusicDashboard>
           _musicList = json.decode(response.body)['data'] ?? [];
           _isLoading = false;
         });
+        // 搜索时不缓存，只缓存全量列表
+        if (_searchQuery.isEmpty) {
+          _cacheMusicList();
+        }
+        if (isRefresh) {
+          _showToast('音乐列表已更新');
+        }
       }
     } catch (e) {
       setState(() => _isLoading = false);
+      if (isRefresh) {
+        _showToast('刷新失败，请检查网络连接');
+      }
     }
+  }
+
+  // 下拉刷新回调
+  Future<void> _onRefresh() async {
+    await _fetchMusic(isRefresh: true);
   }
 
   void _showToast(String message) {
@@ -614,7 +685,7 @@ class _MusicDashboardState extends State<MusicDashboard>
   }
 
   // --- 喜欢列表管理 ---
-  void _toggleFavorite(String musicId) {
+  Future<void> _toggleFavorite(String musicId) async {
     setState(() {
       if (_favoriteIds.contains(musicId)) {
         _favoriteIds.remove(musicId);
@@ -624,8 +695,8 @@ class _MusicDashboardState extends State<MusicDashboard>
         _showToast('已添加到喜欢');
       }
     });
-    // 立即单独保存喜欢列表，确保 iOS 上不会因其他数据保存失败而丢失
-    _saveFavorites();
+    // 立即同步保存喜欢列表，确保 iOS 上不会因退出丢失
+    await _saveFavorites();
   }
 
   bool _isFavorite(String musicId) {
@@ -857,18 +928,59 @@ class _MusicDashboardState extends State<MusicDashboard>
   }
 
   Widget _buildHomePage() {
-    return CustomScrollView(
-      slivers: [
-        _buildAppBar(),
-        SliverToBoxAdapter(child: _buildSearchBar()),
-        if (!_isLoading && _recentList.isNotEmpty) ...[
-          SliverToBoxAdapter(child: _buildSectionTitle("最近播放")),
-          _buildRecentGrid(),
+    return RefreshIndicator(
+      onRefresh: _onRefresh,
+      color: const Color(0xFFFF4444),
+      backgroundColor: Colors.white,
+      displacement: 60,
+      child: CustomScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        slivers: [
+          _buildAppBar(),
+          SliverToBoxAdapter(child: _buildSearchBar()),
+          if (!_isLoading && _recentList.isNotEmpty) ...[
+            SliverToBoxAdapter(child: _buildSectionTitle("最近播放")),
+            _buildRecentGrid(),
+          ],
+          SliverToBoxAdapter(child: _buildSectionTitle("全部音乐")),
+          if (_isLoading)
+            const SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(
+                child: Padding(
+                  padding: EdgeInsets.only(bottom: 120),
+                  child: CircularProgressIndicator(
+                    color: Color(0xFFFF4444),
+                    strokeWidth: 3,
+                  ),
+                ),
+              ),
+            )
+          else if (_musicList.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 120),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.music_off, size: 60, color: Colors.grey[400]),
+                      const SizedBox(height: 12),
+                      Text(
+                        '暂无音乐，下拉刷新试试',
+                        style: TextStyle(fontSize: 15, color: Colors.grey[500]),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
+          else
+            _buildMusicList(),
+          const SliverToBoxAdapter(child: SizedBox(height: 120)),
         ],
-        SliverToBoxAdapter(child: _buildSectionTitle("全部音乐")),
-        _buildMusicList(),
-        const SliverToBoxAdapter(child: SizedBox(height: 120)),
-      ],
+      ),
     );
   }
 
@@ -959,12 +1071,22 @@ class _MusicDashboardState extends State<MusicDashboard>
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.network(
-                '$baseUrl/api/music/${music['id']}/cover',
+              child: CachedNetworkImage(
+                imageUrl: '$baseUrl/api/music/${music['id']}/cover',
                 width: 50,
                 height: 50,
                 fit: BoxFit.cover,
-                errorBuilder: (context, error, stackTrace) => Container(
+                placeholder: (context, url) => Container(
+                  width: 50,
+                  height: 50,
+                  color: Colors.grey[200],
+                  child: const Icon(
+                    Icons.music_note,
+                    color: Colors.grey,
+                    size: 24,
+                  ),
+                ),
+                errorWidget: (context, url, error) => Container(
                   width: 50,
                   height: 50,
                   color: Colors.grey[300],
@@ -1049,6 +1171,8 @@ class _MusicDashboardState extends State<MusicDashboard>
             hintText: '搜索歌曲...',
             prefixIcon: const Icon(Icons.search, size: 20),
             border: InputBorder.none,
+            contentPadding: const EdgeInsets.symmetric(vertical: 14),
+            isCollapsed: true,
             suffixIcon: _searchQuery.isNotEmpty
                 ? IconButton(
                     icon: const Icon(Icons.clear, size: 20),
@@ -1172,12 +1296,23 @@ class _MusicDashboardState extends State<MusicDashboard>
   }) {
     Widget img = ClipRRect(
       borderRadius: BorderRadius.circular(radius),
-      child: Image.network(
-        '$baseUrl/api/music/${music['id']}/cover',
+      child: CachedNetworkImage(
+        imageUrl: '$baseUrl/api/music/${music['id']}/cover',
         width: size,
         height: size,
         fit: BoxFit.cover,
-        errorBuilder: (c, e, s) => Container(
+        placeholder: (c, url) => Container(
+          width: size,
+          height: size,
+          decoration: BoxDecoration(
+            color: Colors.grey[200],
+            borderRadius: BorderRadius.circular(radius),
+          ),
+          child: const Icon(Icons.music_note, color: Colors.grey),
+        ),
+        errorWidget: (c, url, e) => Container(
+          width: size,
+          height: size,
           color: Colors.grey[200],
           child: const Icon(Icons.music_note),
         ),

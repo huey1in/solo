@@ -39,6 +39,7 @@ dependencies:
   permission_handler: ^11.0.0
   just_audio: ^0.9.36
   shared_preferences: ^2.2.2
+  cached_network_image: ^3.4.1
 
 dev_dependencies:
   flutter_test:

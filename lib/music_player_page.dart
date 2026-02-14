@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:ui';
 import 'main.dart'; // 确保导入 PlayMode 枚举
 
@@ -291,10 +292,17 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(20),
-            child: Image.network(
-              url,
+            child: CachedNetworkImage(
+              imageUrl: url,
               fit: BoxFit.cover,
-              errorBuilder: (context, error, stackTrace) => Container(
+              placeholder: (context, url) => Container(
+                color: Colors.grey[900],
+                child: const CircularProgressIndicator(
+                  color: Colors.white38,
+                  strokeWidth: 2,
+                ),
+              ),
+              errorWidget: (context, url, error) => Container(
                 color: Colors.grey[900],
                 child: const Icon(
                   Icons.music_note,
@@ -611,12 +619,23 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
                               return ListTile(
                                 leading: ClipRRect(
                                   borderRadius: BorderRadius.circular(6),
-                                  child: Image.network(
-                                    '${widget.baseUrl}/api/music/${music['id']}/cover',
+                                  child: CachedNetworkImage(
+                                    imageUrl:
+                                        '${widget.baseUrl}/api/music/${music['id']}/cover',
                                     width: 42,
                                     height: 42,
                                     fit: BoxFit.cover,
-                                    errorBuilder: (c, e, s) => Container(
+                                    placeholder: (c, url) => Container(
+                                      width: 42,
+                                      height: 42,
+                                      color: Colors.grey[800],
+                                      child: const Icon(
+                                        Icons.music_note,
+                                        color: Colors.grey,
+                                        size: 20,
+                                      ),
+                                    ),
+                                    errorWidget: (c, url, e) => Container(
                                       width: 42,
                                       height: 42,
                                       color: Colors.grey[800],
