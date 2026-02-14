@@ -69,6 +69,7 @@ class _MusicDashboardState extends State<MusicDashboard>
   PlayMode _playMode = PlayMode.listLoop;
   late AnimationController _rotationController;
   Timer? _saveProgressTimer; // 定时保存进度的定时器
+  bool _isInitialized = false; // 标记是否已完成初始化加载，防止未加载完就触发保存
 
   @override
   void initState() {
@@ -99,7 +100,7 @@ class _MusicDashboardState extends State<MusicDashboard>
 
     // 启动定时保存，每5秒保存一次播放进度
     _saveProgressTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (_currentPlayingMusic != null) {
+      if (_isInitialized && _currentPlayingMusic != null) {
         _savePreferences();
       }
     });
@@ -152,6 +153,7 @@ class _MusicDashboardState extends State<MusicDashboard>
   // 初始化：加载设置和数据
   Future<void> _initApp() async {
     await _loadPreferences();
+    _isInitialized = true; // 标记已完成加载，允许保存
     // 先加载本地缓存
     await _loadCachedMusicList();
     // 如果缓存为空，则从服务器获取
@@ -190,20 +192,26 @@ class _MusicDashboardState extends State<MusicDashboard>
 
   // 加载保存的设置
   Future<void> _loadPreferences() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
+    final prefs = await SharedPreferences.getInstance();
 
-      // 加载播放模式
+    // 每个部分单独 try-catch，防止一个失败影响其他
+    try {
       final playModeIndex = prefs.getInt('playMode') ?? PlayMode.listLoop.index;
       setState(() {
         _playMode = PlayMode.values[playModeIndex];
       });
+    } catch (e) {
+      print('加载播放模式失败: $e');
+    }
 
-      // 加载音量
+    try {
       final savedVolume = prefs.getDouble('volume') ?? 1.0;
       _audioPlayer.setVolume(savedVolume);
+    } catch (e) {
+      print('加载音量失败: $e');
+    }
 
-      // 加载最近播放列表
+    try {
       final recentJson = prefs.getString('recentList');
       if (recentJson != null) {
         final decoded = json.decode(recentJson) as List;
@@ -211,8 +219,11 @@ class _MusicDashboardState extends State<MusicDashboard>
           _recentList = decoded;
         });
       }
+    } catch (e) {
+      print('加载最近播放失败: $e');
+    }
 
-      // 加载播放队列
+    try {
       final queueJson = prefs.getString('playQueue');
       if (queueJson != null) {
         final decoded = json.decode(queueJson) as List;
@@ -220,8 +231,11 @@ class _MusicDashboardState extends State<MusicDashboard>
           _playQueue = decoded;
         });
       }
+    } catch (e) {
+      print('加载播放队列失败: $e');
+    }
 
-      // 加载喜欢列表
+    try {
       final favoritesJson = prefs.getString('favorites');
       if (favoritesJson != null) {
         final decoded = json.decode(favoritesJson) as List;
@@ -229,8 +243,11 @@ class _MusicDashboardState extends State<MusicDashboard>
           _favoriteIds = decoded.cast<String>();
         });
       }
+    } catch (e) {
+      print('加载喜欢列表失败: $e');
+    }
 
-      // 加载当前播放音乐
+    try {
       final currentMusicJson = prefs.getString('currentMusic');
       if (currentMusicJson != null) {
         final music = json.decode(currentMusicJson);
@@ -240,22 +257,21 @@ class _MusicDashboardState extends State<MusicDashboard>
           _currentPlayingMusic = music;
         });
 
-        // 恢复播放状态（但不自动播放）
         try {
           await _audioPlayer.setUrl('$baseUrl/api/music/${music['id']}/stream');
           await _audioPlayer.seek(Duration(milliseconds: savedPosition));
-          // 不自动播放，等待用户点击
         } catch (e) {
           print('恢复播放失败: $e');
         }
       }
     } catch (e) {
-      print('加载设置失败: $e');
+      print('加载当前播放音乐失败: $e');
     }
   }
 
   // 单独保存喜欢列表（确保收藏保存不受其他数据影响）
   Future<void> _saveFavorites() async {
+    if (!_isInitialized) return; // 未初始化完成不保存，防止空数据覆盖
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('favorites', json.encode(_favoriteIds));
@@ -266,6 +282,7 @@ class _MusicDashboardState extends State<MusicDashboard>
 
   // 保存设置
   Future<void> _savePreferences() async {
+    if (!_isInitialized) return; // 未初始化完成不保存，防止空数据覆盖
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt('playMode', _playMode.index);
