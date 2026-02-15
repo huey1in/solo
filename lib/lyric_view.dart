@@ -109,15 +109,15 @@ class _LyricViewState extends State<LyricView> {
         final minutes = int.parse(match.group(1)!);
         final seconds = int.parse(match.group(2)!);
         final msStr = match.group(3)!;
-        final ms = msStr.length == 2
-            ? int.parse(msStr) * 10
-            : int.parse(msStr);
+        final ms = msStr.length == 2 ? int.parse(msStr) * 10 : int.parse(msStr);
         final text = match.group(4)?.trim() ?? '';
         if (text.isNotEmpty) {
-          lines.add(LyricLine(
-            Duration(minutes: minutes, seconds: seconds, milliseconds: ms),
-            text,
-          ));
+          lines.add(
+            LyricLine(
+              Duration(minutes: minutes, seconds: seconds, milliseconds: ms),
+              text,
+            ),
+          );
         }
       }
     }
@@ -147,7 +147,16 @@ class _LyricViewState extends State<LyricView> {
     if (!_scrollController.hasClients) return;
     if (_currentLineIndex < 0) return;
 
-    final targetOffset = (_currentLineIndex * 48.0) - 120.0;
+    // 获取可视区域高度
+    final viewportHeight = _scrollController.position.viewportDimension;
+    // 每行歌词的高度（包括padding）
+    const lineHeight = 48.0;
+    // 计算目标偏移量：当前行位置 - 屏幕中间位置
+    final targetOffset =
+        (_currentLineIndex * lineHeight) -
+        (viewportHeight / 2) +
+        (lineHeight / 2);
+
     _scrollController.animateTo(
       targetOffset.clamp(0.0, _scrollController.position.maxScrollExtent),
       duration: const Duration(milliseconds: 300),
@@ -193,19 +202,14 @@ class _LyricViewState extends State<LyricView> {
         return AnimatedDefaultTextStyle(
           duration: const Duration(milliseconds: 300),
           style: TextStyle(
-            color: isActive
-                ? Colors.white
-                : Colors.white.withOpacity(0.35),
+            color: isActive ? Colors.white : Colors.white.withOpacity(0.35),
             fontSize: isActive ? 18 : 15,
             fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
             height: 1.8,
           ),
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
-            child: Text(
-              _lyrics[index].text,
-              textAlign: TextAlign.center,
-            ),
+            child: Text(_lyrics[index].text, textAlign: TextAlign.center),
           ),
         );
       },

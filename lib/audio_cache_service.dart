@@ -76,10 +76,7 @@ class AudioCacheService {
     } else {
       // 未缓存：使用 LockCachingAudioSource 边播边缓存到本地
       final cacheFile = _getCacheFile(url);
-      return LockCachingAudioSource(
-        Uri.parse(url),
-        cacheFile: cacheFile,
-      );
+      return LockCachingAudioSource(Uri.parse(url), cacheFile: cacheFile);
     }
   }
 
@@ -97,8 +94,9 @@ class AudioCacheService {
       if (totalSize <= _maxCacheSize) return;
 
       // 按最后修改时间排序（最旧的在前）
-      files.sort((a, b) =>
-          a.lastModifiedSync().compareTo(b.lastModifiedSync()));
+      files.sort(
+        (a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()),
+      );
 
       // 删除最旧的文件直到缓存大小低于限制
       for (final file in files) {
@@ -149,7 +147,6 @@ class AudioCacheService {
 
       final sink = tempFile.openWrite();
       int downloaded = 0;
-      final contentLength = response.contentLength ?? 0;
 
       await for (final chunk in response.stream) {
         if (_preloadCancelled) {
