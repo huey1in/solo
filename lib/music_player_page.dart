@@ -173,9 +173,14 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
     final bool hasCover = _currentMusic?['has_cover'] == true;
     final coverUrl = hasCover ? '${widget.baseUrl}/api/music/$musicId/cover' : '';
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.95,
+      decoration: const BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Stack(
         children: [
           // 1. 沉浸式模糊背景
           _buildBlurredBackground(coverUrl),
@@ -183,6 +188,7 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
           // 2. 黑色渐变层（增强文字可读性）
           Container(
             decoration: BoxDecoration(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
@@ -197,8 +203,20 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
 
           // 3. 内容层
           SafeArea(
+            top: false,
             child: Column(
               children: [
+                // 拖拽手柄
+                const SizedBox(height: 10),
+                Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.4),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(height: 6),
                 _buildTopBar(),
                 const Spacer(),
 
@@ -222,7 +240,7 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
                 _buildSongInfo(),
                 _buildProgressBar(),
                 _buildMainControls(),
-                const SizedBox(height: 40),
+                SizedBox(height: MediaQuery.of(context).padding.bottom + 20),
               ],
             ),
           ),
@@ -266,27 +284,7 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
             ),
             onPressed: () => Navigator.pop(context),
           ),
-          Column(
-            children: [
-              Text(
-                '正在播放',
-                style: TextStyle(
-                  color: Colors.white.withOpacity(0.6),
-                  fontSize: 12,
-                  letterSpacing: 1.2,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                _currentMusic?['title'] ?? '未知歌曲',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 14,
-                ),
-              ),
-            ],
-          ),
+          const Spacer(),
           IconButton(
             icon: const Icon(Icons.more_horiz, color: Colors.white),
             onPressed: _showPlayQueue,
@@ -298,9 +296,7 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
 
   Widget _buildHeroCover(String url, String? id) {
     return Center(
-      child: Hero(
-        tag: 'cover_$id', // 与首页 Tag 保持一致
-        child: Container(
+      child: Container(
           width: MediaQuery.of(context).size.width * 0.8,
           height: MediaQuery.of(context).size.width * 0.8,
           decoration: BoxDecoration(
@@ -344,7 +340,6 @@ class _MusicPlayerPageState extends State<MusicPlayerPage>
                   ),
                 ),
           ),
-        ),
       ),
     );
   }

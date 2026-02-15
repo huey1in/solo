@@ -66,8 +66,13 @@ class _MusicDashboardState extends State<MusicDashboard>
   List<dynamic> _musicList = [];
   List<dynamic> _recentList = [];
   bool _isLoading = true;
+  bool _isLoadingMore = false;
+  int _currentPage = 1;
+  int _totalPages = 1;
+  static const int _pageSize = 30;
   String _searchQuery = "";
   final TextEditingController _searchController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
 
   // 播放队列（当前播放的歌曲列表）
   List<dynamic> _playQueue = [];
@@ -86,8 +91,10 @@ class _MusicDashboardState extends State<MusicDashboard>
   late AnimationController _rotationController;
   Timer? _saveProgressTimer; // 定时保存进度的定时器
   Timer? _searchDebounce; // 搜索防抖定时器
+  Timer? _healthCheckTimer; // 播放器健康检查定时器
   bool _isInitialized = false; // 标记是否已完成初始化加载，防止未加载完就触发保存
   bool _isOffline = false; // 网络状态
+  bool _isRecovering = false; // 是否正在从后台恢复
   StreamSubscription? _connectivitySubscription;
 
   @override
@@ -95,6 +102,7 @@ class _MusicDashboardState extends State<MusicDashboard>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initApp();
+    _scrollController.addListener(_onScroll);
     _rotationController = AnimationController(
       duration: const Duration(seconds: 15),
       vsync: this,
@@ -152,14 +160,21 @@ class _MusicDashboardState extends State<MusicDashboard>
         _savePreferences();
       }
     });
+
+    // 启动播放器健康检查，每30秒检查一次
+    _healthCheckTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      _checkPlayerHealth();
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _saveProgressTimer?.cancel();
+    _healthCheckTimer?.cancel();
     _searchDebounce?.cancel();
     _connectivitySubscription?.cancel();
+    _scrollController.dispose();
     _savePreferences(); // 最后保存一次
     _audioPlayer.dispose();
     _rotationController.dispose();
@@ -175,6 +190,11 @@ class _MusicDashboardState extends State<MusicDashboard>
         state == AppLifecycleState.inactive) {
       // 使用 unawaited 但确保 SharedPreferences 立即写入
       _saveAllDataImmediately();
+    }
+
+    // 从后台恢复时重新初始化播放器
+    if (state == AppLifecycleState.resumed) {
+      _recoverFromBackground();
     }
   }
 
@@ -196,6 +216,105 @@ class _MusicDashboardState extends State<MusicDashboard>
       ]);
     } catch (e) {
       print('紧急保存数据失败: $e');
+    }
+  }
+
+  // 从后台恢复应用
+  Future<void> _recoverFromBackground() async {
+    if (_isRecovering) return;
+    _isRecovering = true;
+
+    try {
+      print('从后台恢复应用');
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      // 重新激活音频会话
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+
+      // 如果有正在播放的歌曲，主动重置播放器状态
+      if (_currentPlayingMusic != null) {
+        final state = _audioPlayer.processingState;
+        print('播放器状态: $state');
+
+        // 无论当前状态如何，都尝试 stop 来重置内部 HTTP 连接状态
+        // 这样后续 _playMusic 调用 setAudioSource 时不会因为旧连接失效而失败
+        if (state == ProcessingState.idle ||
+            state == ProcessingState.loading) {
+          await _reloadCurrentMusic();
+        } else {
+          // 即使状态看起来正常(ready/completed/buffering)，也主动 stop 重置
+          // 防止长时间后台挂起导致底层 HTTP client 失效
+          try {
+            await _audioPlayer.stop();
+            await _reloadCurrentMusic();
+          } catch (e) {
+            print('主动重置播放器失败: $e');
+          }
+        }
+      }
+    } catch (e) {
+      print('后台恢复失败: $e');
+    } finally {
+      _isRecovering = false;
+    }
+  }
+
+  // 重新加载当前音乐
+  Future<void> _reloadCurrentMusic() async {
+    if (_currentPlayingMusic == null) return;
+
+    try {
+      final streamUrl = '$baseUrl/api/music/${_currentPlayingMusic['id']}/stream';
+      final wasPlaying = _isPlaying;
+
+      await _audioPlayer.stop();
+
+      if (AudioCacheService.instance.isCached(streamUrl)) {
+        await _audioPlayer.setAudioSource(
+          AudioSource.file(AudioCacheService.instance.getCacheFilePath(streamUrl)),
+          initialPosition: _currentPosition,
+        );
+      } else {
+        await _audioPlayer.setAudioSource(
+          LockCachingAudioSource(
+            Uri.parse(streamUrl),
+            cacheFile: AudioCacheService.instance.getCacheFile(streamUrl),
+          ),
+          initialPosition: _currentPosition,
+        );
+      }
+
+      if (wasPlaying) {
+        await _audioPlayer.play();
+      }
+
+      print('播放器恢复成功');
+    } catch (e) {
+      print('播放器恢复失败: $e');
+    }
+  }
+
+  // 检查播放器健康状态
+  void _checkPlayerHealth() {
+    if (_currentPlayingMusic == null) return;
+
+    try {
+      final state = _audioPlayer.processingState;
+      final position = _audioPlayer.position;
+      final duration = _audioPlayer.duration;
+
+      print('播放器健康检查: state=$state, position=$position, duration=$duration');
+
+      // 如果播放器状态异常且有正在播放的音乐，尝试恢复
+      if (state == ProcessingState.idle) {
+        if (_isPlaying) {
+          print('检测到播放器异常，尝试恢复');
+          _reloadCurrentMusic();
+        }
+      }
+    } catch (e) {
+      print('播放器健康检查异常: $e');
     }
   }
 
@@ -535,18 +654,33 @@ class _MusicDashboardState extends State<MusicDashboard>
     }
   }
 
-  Future<void> _fetchMusic({bool isRefresh = false}) async {
+  Future<void> _fetchMusic({bool isRefresh = false, bool loadMore = false}) async {
+    if (_isLoadingMore && loadMore) return; // 防止重复加载
+    final page = loadMore ? _currentPage + 1 : 1;
+
+    if (loadMore) setState(() => _isLoadingMore = true);
+
     try {
       final response = await http.get(
-        Uri.parse('$baseUrl/api/music?search=$_searchQuery&page=1&page_size=200'),
+        Uri.parse('$baseUrl/api/music?search=$_searchQuery&page=$page&page_size=$_pageSize'),
       );
       if (response.statusCode == 200) {
+        final body = json.decode(response.body);
+        final List<dynamic> newData = body['data'] ?? [];
+        final pagination = body['pagination'];
         setState(() {
-          _musicList = json.decode(response.body)['data'] ?? [];
+          if (loadMore) {
+            _musicList.addAll(newData);
+          } else {
+            _musicList = newData;
+          }
+          _currentPage = page;
+          _totalPages = pagination?['total_page'] ?? 1;
           _isLoading = false;
+          _isLoadingMore = false;
         });
-        // 搜索时不缓存，只缓存全量列表
-        if (_searchQuery.isEmpty) {
+        // 搜索时不缓存，只缓存第一页全量列表
+        if (_searchQuery.isEmpty && !loadMore) {
           _cacheMusicList();
         }
         if (isRefresh) {
@@ -554,14 +688,31 @@ class _MusicDashboardState extends State<MusicDashboard>
         }
       }
     } catch (e) {
-      setState(() => _isLoading = false);
+      setState(() {
+        _isLoading = false;
+        _isLoadingMore = false;
+      });
       if (isRefresh) {
         _showToast('刷新失败，请检查网络连接');
       }
     }
   }
 
-  // 下拉刷新回调
+  // 滚动监听：接近底部时加载更多
+  void _onScroll() {
+    if (_scrollController.position.pixels >=
+        _scrollController.position.maxScrollExtent - 300) {
+      _loadMore();
+    }
+  }
+
+  // 加载下一页
+  void _loadMore() {
+    if (_isLoadingMore || _currentPage >= _totalPages) return;
+    _fetchMusic(loadMore: true);
+  }
+
+  // 下拉刷新回调：重置分页
   Future<void> _onRefresh() async {
     await _fetchMusic(isRefresh: true);
   }
@@ -603,41 +754,56 @@ class _MusicDashboardState extends State<MusicDashboard>
     try {
       _preloadTriggered = false; // 重置预加载标志
       AudioCacheService.instance.cancelPreload(); // 取消旧的预加载，释放带宽给当前歌曲
-      final streamUrl = '$baseUrl/api/music/${music['id']}/stream';
-      // 优先使用本地缓存，否则边播边缓存
-      if (AudioCacheService.instance.isCached(streamUrl)) {
-        await _audioPlayer.setAudioSource(
-          AudioSource.file(AudioCacheService.instance.getCacheFilePath(streamUrl)),
-        );
-      } else {
-        await _audioPlayer.setAudioSource(
-          LockCachingAudioSource(
-            Uri.parse(streamUrl),
-            cacheFile: AudioCacheService.instance.getCacheFile(streamUrl),
-          ),
-        );
-      }
+      await _setAudioSource(music);
       _audioPlayer.play();
       _savePreferences(); // 保存当前播放音乐
     } catch (e) {
-      // 如果歌曲无法播放（可能已被删除），跳到下一首
-      _showToast('歌曲「${music['title']}」无法播放，已跳过');
+      print('播放失败(首次): $e');
+      // 首次失败：可能是后台挂起导致播放器状态异常，重置后重试一次
+      try {
+        await _audioPlayer.stop();
+        await Future.delayed(const Duration(milliseconds: 200));
+        await _setAudioSource(music);
+        _audioPlayer.play();
+        _savePreferences();
+        print('重试播放成功');
+      } catch (retryError) {
+        print('重试播放也失败: $retryError');
+        _showToast('歌曲「${music['title']}」无法播放，已跳过');
 
-      // 从喜欢列表中移除（如果存在）
-      if (_isFavorite(music['id'])) {
+        // 从喜欢列表中移除（如果存在）
+        if (_isFavorite(music['id'])) {
+          setState(() {
+            _favoriteSongs.removeWhere((m) => m['id'] == music['id']);
+          });
+          _saveFavorites();
+        }
+
+        // 从播放队列中移除
         setState(() {
-          _favoriteSongs.removeWhere((m) => m['id'] == music['id']);
+          _playQueue.removeWhere((m) => m['id'] == music['id']);
         });
-        _saveFavorites();
+
+        // 播放下一首
+        _handleNext();
       }
+    }
+  }
 
-      // 从播放队列中移除
-      setState(() {
-        _playQueue.removeWhere((m) => m['id'] == music['id']);
-      });
-
-      // 播放下一首
-      _handleNext();
+  // 设置音频源（提取公共逻辑，避免重复代码）
+  Future<void> _setAudioSource(dynamic music) async {
+    final streamUrl = '$baseUrl/api/music/${music['id']}/stream';
+    if (AudioCacheService.instance.isCached(streamUrl)) {
+      await _audioPlayer.setAudioSource(
+        AudioSource.file(AudioCacheService.instance.getCacheFilePath(streamUrl)),
+      );
+    } else {
+      await _audioPlayer.setAudioSource(
+        LockCachingAudioSource(
+          Uri.parse(streamUrl),
+          cacheFile: AudioCacheService.instance.getCacheFile(streamUrl),
+        ),
+      );
     }
   }
 
@@ -1064,7 +1230,13 @@ class _MusicDashboardState extends State<MusicDashboard>
     return Scaffold(
       body: Stack(
         children: [
-          _currentIndex == 0 ? _buildHomePage() : _buildFavoritesPage(),
+          IndexedStack(
+            index: _currentIndex,
+            children: [
+              _buildHomePage(),
+              _buildFavoritesPage(),
+            ],
+          ),
           if (_currentPlayingMusic != null) _buildGlassBottomPlayer(),
         ],
       ),
@@ -1092,6 +1264,7 @@ class _MusicDashboardState extends State<MusicDashboard>
       backgroundColor: Colors.white,
       displacement: 60,
       child: CustomScrollView(
+        controller: _scrollController,
         physics: const AlwaysScrollableScrollPhysics(),
         slivers: [
           _buildAppBar(),
@@ -1134,8 +1307,37 @@ class _MusicDashboardState extends State<MusicDashboard>
                 ),
               ),
             )
-          else
+          else ...[
             _buildMusicList(),
+            if (_isLoadingMore)
+              const SliverToBoxAdapter(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 20),
+                  child: Center(
+                    child: SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.5,
+                        color: Color(0xFFFF4444),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            if (!_isLoadingMore && _currentPage >= _totalPages && _musicList.isNotEmpty)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 20),
+                  child: Center(
+                    child: Text(
+                      '— 已加载全部 ${_musicList.length} 首 —',
+                      style: TextStyle(color: Colors.grey[400], fontSize: 13),
+                    ),
+                  ),
+                ),
+              ),
+          ],
           const SliverToBoxAdapter(child: SizedBox(height: 120)),
         ],
       ),
@@ -1391,7 +1593,7 @@ class _MusicDashboardState extends State<MusicDashboard>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _buildCover(music, size: 130, radius: 20, showHero: true),
+                    _buildCover(music, size: 130, radius: 20, showHero: true, useThumbnail: true),
                     const SizedBox(height: 10),
                     Text(
                       music['title'] ?? '',
@@ -1437,7 +1639,8 @@ class _MusicDashboardState extends State<MusicDashboard>
               size: 50,
               radius: 10,
               showHero: !isCurr,
-              showAnimation: isCurr && _isPlaying, // 显示动画遮罩
+              showAnimation: isCurr && _isPlaying,
+              useThumbnail: true, // 列表使用缩略图
             ),
             title: Text(
               music['title'] ?? '',
@@ -1465,13 +1668,17 @@ class _MusicDashboardState extends State<MusicDashboard>
     required double radius,
     bool showHero = false,
     bool showAnimation = false, // 是否显示播放动画
+    bool useThumbnail = false, // 列表中使用缩略图
   }) {
     final bool hasCover = music['has_cover'] == true;
+    final coverUrl = useThumbnail
+        ? '$baseUrl/api/music/${music['id']}/cover?thumb=1'
+        : '$baseUrl/api/music/${music['id']}/cover';
     Widget img = ClipRRect(
       borderRadius: BorderRadius.circular(radius),
       child: hasCover
           ? CachedNetworkImage(
-              imageUrl: '$baseUrl/api/music/${music['id']}/cover',
+              imageUrl: coverUrl,
               width: size,
               height: size,
               fit: BoxFit.cover,
@@ -1526,6 +1733,43 @@ class _MusicDashboardState extends State<MusicDashboard>
     return showHero ? Hero(tag: 'cover_${music['id']}', child: img) : img;
   }
 
+  // 上拉面板打开播放器页面
+  void _openPlayerSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true, // 全屏
+      backgroundColor: Colors.transparent,
+      enableDrag: true, // 下拉收起
+      builder: (context) => MusicPlayerPage(
+        getCurrentMusic: () => _currentPlayingMusic,
+        audioPlayer: _audioPlayer,
+        isPlaying: _isPlaying,
+        currentPosition: _currentPosition,
+        totalDuration: _totalDuration,
+        onPlayPause: () => _playMusic(_currentPlayingMusic),
+        onNext: _handleNext,
+        onPrevious: _handlePrevious,
+        playMode: _playMode,
+        onTogglePlayMode: _togglePlayMode,
+        onVolumeChanged: _onVolumeChanged,
+        isFavorite: _isFavorite(_currentPlayingMusic['id']),
+        onToggleFavorite: () {
+          setState(() {
+            _toggleFavorite(_currentPlayingMusic);
+          });
+        },
+        checkIsFavorite: _isFavorite,
+        playQueue: _playQueue,
+        onPlayFromQueue: (music) => _playMusic(music),
+        baseUrl: baseUrl,
+        onClose: () {
+          setState(() => _currentPlayingMusic = null);
+          _savePreferences();
+        },
+      ),
+    );
+  }
+
   // iOS 26 Liquid Glass 拟态玻璃浮动底栏
   Widget _buildGlassBottomPlayer() {
     return Positioned(
@@ -1533,38 +1777,7 @@ class _MusicDashboardState extends State<MusicDashboard>
       left: 15,
       right: 15,
       child: GestureDetector(
-        onTap: () => Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (context) => MusicPlayerPage(
-              getCurrentMusic: () => _currentPlayingMusic,
-              audioPlayer: _audioPlayer,
-              isPlaying: _isPlaying,
-              currentPosition: _currentPosition,
-              totalDuration: _totalDuration,
-              onPlayPause: () => _playMusic(_currentPlayingMusic),
-              onNext: _handleNext,
-              onPrevious: _handlePrevious,
-              playMode: _playMode,
-              onTogglePlayMode: _togglePlayMode,
-              onVolumeChanged: _onVolumeChanged,
-              isFavorite: _isFavorite(_currentPlayingMusic['id']),
-              onToggleFavorite: () {
-                setState(() {
-                  _toggleFavorite(_currentPlayingMusic);
-                });
-              },
-              checkIsFavorite: _isFavorite,
-              playQueue: _playQueue,
-              onPlayFromQueue: (music) => _playMusic(music),
-              baseUrl: baseUrl,
-              onClose: () {
-                setState(() => _currentPlayingMusic = null);
-                _savePreferences();
-              },
-            ),
-          ),
-        ),
+        onTap: () => _openPlayerSheet(),
         child: Container(
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(24),
@@ -1731,6 +1944,7 @@ class _MusicDashboardState extends State<MusicDashboard>
                                 size: 48,
                                 radius: 24,
                                 showHero: true,
+                                useThumbnail: true,
                               ),
                             ),
                           ),
